@@ -1,4 +1,4 @@
-#include "LCD.h"
+#include "LCD.h"            
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -8,6 +8,22 @@
  *      创建于2026-10-23
  *******************************/
 LCD_Param_TypeDef LCD_Param;
+uint8_t LCD_Panel_State = 0xFF;      /* 面板 ID 自检结果，0=读到 0x7796，1=不符 */
+
+/* 记录上一次在某个锚点画过的文本宽度，用于只擦"文本变短"多出来的尾巴。
+   四个槽位覆盖常见的几行状态显示；没命中就认为该位置没有旧内容可擦。
+   放在文件前部是因为 LCD_SetRotation() 切屏时要一次性清空它们。 */
+#define LCD_TRACE_SLOTS     4
+
+typedef struct
+{
+    uint16_t X, Y, W;
+    uint8_t  Font;
+    uint8_t  Used;
+} LCD_Trace_t;
+
+static LCD_Trace_t LCD_Trace[LCD_TRACE_SLOTS];
+static uint8_t     LCD_TraceNext = 0;
 /**
  * @brief       写入ST7796指定寄存器
  * @param       Reg : 起始寄存器地址
@@ -38,20 +54,19 @@ static void LCD_Write_RegData(uint16_t Reg , uint16_t data)
     LCD->LCD_RAM = data;
 }
 
-static void lcd_opt_delay(uint32_t i)
-{
-    volatile uint32_t n = i;
-    while (n--);
-}
 /**
  * @brief       从ST7796读数据
  * @param
  * @retval      读出的数据
+ * @note        这里原本有一句 lcd_opt_delay(2) 的经验性补偿，是为了掩盖 FSMC 读时序
+ *              只有 83.3ns（ST7796 要求 TRC>=160ns、读 ID 时 TCS>=45ns）的问题。
+ *              现在 Core/Src/fsmc.c 已改成扩展模式，读时序单独配置为
+ *              ADDSET=5/DATAST=8（15 HCLK = 208ns），总线本身已经合规，
+ *              补偿延时整段删除。读 GRAM(0x2E) 需要 450ns，本驱动不使用。
  */
 static uint16_t LCD_Read_Data(void)
 {
     volatile uint16_t data = 0;
-    lcd_opt_delay(2);
     data = LCD->LCD_RAM;
     return data;
 }
@@ -65,7 +80,8 @@ static void LCD_ST7796_RegInit(void)
     LCD_Write_Reg(0x11);              /* SLPOUT 退出睡眠 */
     HAL_Delay(120);
 
-    LCD_Write_RegData(0x36, 0x08);    /* MADCTL：竖屏，MX=0、MY=0、BGR=1 */
+    /* MADCTL(0x36) 不在这里写：方向统一由 LCD_SetRotation() 负责，
+       避免同一寄存器两处赋值、改方向时漏掉一处 */
     LCD_Write_RegData(0x3A, 0x55);    /* COLMOD：16bit/pixel (RGB565) */
 
     LCD_Write_RegData(0xF0, 0xC3);    /* 解锁扩展命令页 */
@@ -156,6 +172,41 @@ static uint8_t LCD_Read_SDA(void)
     return state;
 }
 /**
+ * @brief       使能 DWT 周期计数器（软件 I2C 定专用）
+ * @param
+ * @retval      无
+ * @note        DWT->CYCCNT 每来一个 HCLK 加 1，72MHz 下 1 个 tick = 13.89ns，
+ *              用来做亚微秒级延时不受编译优化等级影响。上电后必须使能，
+ *              只需调用一次（LCD_Init 开头）。
+ */
+static void LCD_I2C_DelayInit(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   /* 打开跟踪单元总开关 */
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              /* 启动周期计数 */
+}
+
+/* SCL 半周期长度，单位 HCLK 周期。72MHz / (180 * 2) = 200kHz，
+   远低于 GT911 快速模式 400kHz 上限，高低电平各 2.5us，
+   同时满足 t_LOW >= 1.3us、t_HIGH >= 0.6us 的要求。 */
+#define LCD_I2C_HALF_CYCLE   180u
+
+/**
+ * @brief       软件 I2C 半周期延时
+ * @param
+ * @retval      无
+ * @note        用无符号减法比较，CYCCNT 回绕（约 59.6s 一次）也不会出错。
+ *              以前这里没有任何延时，SCL 高电平只有一条 GPIO 写指令的宽度
+ *              （约 0.1~0.2us），是 GT911 规格下限的 1/3 ~ 1/6，
+ *              优化等级一变就可能失灵。加延时后时序与编译选项无关。
+ */
+static inline void LCD_I2C_Delay(void)
+{
+    uint32_t t0 = DWT->CYCCNT;
+
+    while ((DWT->CYCCNT - t0) < LCD_I2C_HALF_CYCLE) { }
+}
+/**
  * @brief       IIC起始信号
  * @param
  * @retval      无
@@ -164,8 +215,11 @@ static void LCD_I2C_Start(void)
 {
     LCD_Write_SDA(1);
     LCD_Write_SCL(1);
-    LCD_Write_SDA(0);
+    LCD_I2C_Delay();
+    LCD_Write_SDA(0);          /* SCL 高电平期间 SDA 下降 = 起始 */
+    LCD_I2C_Delay();           /* 起始保持时间 */
     LCD_Write_SCL(0);
+    LCD_I2C_Delay();
 }
 /**
  * @brief       IIC终止信号
@@ -176,7 +230,9 @@ static void LCD_I2C_Stop(void)
 {
     LCD_Write_SDA(0);
     LCD_Write_SCL(1);
-    LCD_Write_SDA(1);
+    LCD_I2C_Delay();
+    LCD_Write_SDA(1);          /* SCL 高电平期间 SDA 上升 = 停止 */
+    LCD_I2C_Delay();
 }
 /**
  * @brief       IIC发送一个字节(8Bit)
@@ -189,8 +245,11 @@ static void LCD_I2C_SendByte(uint8_t Byte)
     for(i = 0;i < 8;i ++)
     {
         LCD_Write_SDA(!!(Byte & (0x80 >> i)));
+        LCD_I2C_Delay();       /* SDA 建立时间，保证 SCL 上升前数据已稳定 */
         LCD_Write_SCL(1);
+        LCD_I2C_Delay();
         LCD_Write_SCL(0);
+        LCD_I2C_Delay();
     }
 }
 /**
@@ -201,12 +260,15 @@ static void LCD_I2C_SendByte(uint8_t Byte)
 static uint8_t LCD_I2C_ReceiveByte(void)
 {
     uint8_t i = 0,Byte = 0x00;
-    LCD_Write_SDA(1);
+    LCD_Write_SDA(1);          /* 释放 SDA，交给从机驱动 */
+    LCD_I2C_Delay();
     for (i = 0;i < 8;i ++)
     {
         LCD_Write_SCL(1);
+        LCD_I2C_Delay();       /* 等从机把数据摆上来再采样 */
         if (LCD_Read_SDA()){Byte |= (0x80 >> i);}
         LCD_Write_SCL(0);
+        LCD_I2C_Delay();
     }
     return Byte;
 }
@@ -218,8 +280,11 @@ static uint8_t LCD_I2C_ReceiveByte(void)
 static void LCD_I2C_SendAck(uint8_t AckBit)
 {
     LCD_Write_SDA(AckBit);
+    LCD_I2C_Delay();
     LCD_Write_SCL(1);
+    LCD_I2C_Delay();
     LCD_Write_SCL(0);
+    LCD_I2C_Delay();
 }
 /**
  * @brief       IIC发送一个应答位
@@ -229,10 +294,13 @@ static void LCD_I2C_SendAck(uint8_t AckBit)
 static uint8_t LCD_I2C_ReceiveAck(void)
 {
     uint8_t AckBit = 0x00;
-    LCD_Write_SDA(1);
+    LCD_Write_SDA(1);          /* 释放 SDA */
+    LCD_I2C_Delay();
     LCD_Write_SCL(1);
+    LCD_I2C_Delay();
     AckBit = LCD_Read_SDA();
     LCD_Write_SCL(0);
+    LCD_I2C_Delay();
     return AckBit;
 }
 
@@ -405,6 +473,43 @@ void LCD_Clear(uint16_t color)
     LCD_Set_Window(0, 0, LCD_Param.Width, LCD_Param.Height);
     LCD_Write_Reg(LCD_Param.WriteGRAM);     /* 0x2C，之后连续写 RAM */
     while (total--) LCD->LCD_RAM = color;
+}
+
+/**
+ * @brief       切换显示方向（竖屏 / 横屏 / 倒置）
+ * @param       Rot : LCD_ROT_0 / LCD_ROT_90 / LCD_ROT_180 / LCD_ROT_270，越界按 0 处理
+ * @retval      无
+ * @note        这是**唯一**允许写 MADCTL 和改 Width/Height 的地方，四件事必须一起做：
+ *              ① 写 MADCTL —— 决定 GRAM 行列与面板像素的映射关系；
+ *              ② 换 W/H   —— 90/270 时宽高互换，所有裁剪/窗口/清屏都依赖它；
+ *              ③ 清锚点   —— LCD_Trace[] 里存的是绝对坐标，转屏后旧记录会擦错位置；
+ *              ④ 清屏     —— 旧内容在新映射下已经错位，必须重画。
+ *
+ *              MADCTL 取值说明（BGR=0x08 固定保留，丢了红蓝互换）：
+ *                MY(0x80) MX(0x40) MV(0x20)  MV=1 即行列交换(宽高互换)
+ *                0x08 竖屏；0x68 / 0xA8 横屏（两者互差 180°，哪个正着用哪个）；0xC8 竖屏倒置
+ *              触摸侧必须用与 MADCTL 配套的公式，见 LCD_T_ScanIT()；
+ *              若横屏画面正确但触摸差 180°，把 ROT_90 与 ROT_270 两条公式对调。
+ *
+ *              运行中调用会清屏（320x480 约 12.8ms），调用者需要自行重画界面。
+ */
+void LCD_SetRotation(uint8_t Rot)
+{
+    static const uint8_t MadctlTab[4] = { 0x08, 0x68, 0xC8, 0xA8 };
+    uint8_t i;
+
+    if (Rot > LCD_ROT_270) Rot = LCD_ROT_0;
+
+    LCD_Write_RegData(0x36, MadctlTab[Rot]);
+
+    LCD_Param.Dir    = Rot;
+    LCD_Param.Width  = (Rot & 1) ? LCD_PANEL_H : LCD_PANEL_W;
+    LCD_Param.Height = (Rot & 1) ? LCD_PANEL_W : LCD_PANEL_H;
+
+    for (i = 0; i < LCD_TRACE_SLOTS; i++) LCD_Trace[i].Used = 0;
+    LCD_TraceNext = 0;
+
+    LCD_Clear(LCD_Param.BackColor);
 }
 
 /**
@@ -716,13 +821,75 @@ void LCD_DrawTriangle(uint16_t X0, uint16_t Y0, uint16_t X1, uint16_t Y1,
     LCD_DrawLine(X2, Y2, X0, Y0);
 }
 
+/*******************************
+ *      LCD批量写入接口
+ *      创建于2026-11-02
+ *******************************/
+
+/**
+ * @brief       把一块 RGB565 缓冲区灌进屏幕
+ * @param       X, Y   : 左上角坐标（必须非负，超出屏幕的部分自动裁掉）
+ * @param       Width  : 缓冲区每行的像素数（**源行长**，裁剪后不变）
+ * @param       Height : 缓冲区行数
+ * @param       Data   : 行优先、小端 uint16_t 数组，长度 = Width*Height
+ * @retval      无
+ * @note        宽度没被裁剪时走最快路径：一次设窗口 + 连续写 GRAM，不做逐点定位。
+ *              不要用 LCD_DrawPoint 拼矩形，那样每个点要 7 次寄存器访问。
+ *
+ *              跨右边界时宽被裁小，源缓冲区仍然按**原始 Width** 分行存放，
+ *              所以此时改为逐行定位指针、每行设一次窗口（与 LCD_DrawBitmap 一致），
+ *              否则第二行会取到源图第一行多出来的那几列，画面斜切。
+ *              行数多时设窗次数等于可见行数，相对整块像素量可以忽略。
+ */
+void LCD_WritePixels(uint16_t X, uint16_t Y, uint16_t Width, uint16_t Height,
+                     const uint16_t *Data)
+{
+    uint32_t cw, ch, row, col, total;
+    const uint16_t *p;
+
+    if (Data == 0 || Width == 0 || Height == 0) return;
+    if (X >= LCD_Param.Width || Y >= LCD_Param.Height) return;
+
+    /* 用 32 位算边界，避免 X + Width 在 uint16_t 上回绕 */
+    cw = Width;
+    if ((uint32_t)X + cw > LCD_Param.Width)  cw = LCD_Param.Width  - X;
+    ch = Height;
+    if ((uint32_t)Y + ch > LCD_Param.Height) ch = LCD_Param.Height - Y;
+    if (cw == 0 || ch == 0) return;
+
+    if (cw == Width)
+    {
+        /* 宽度完整：整块一次设窗、连续灌，最快路径 */
+        total = cw * ch;
+        LCD_Set_Window(X, Y, (uint16_t)cw, (uint16_t)ch);
+        LCD_Write_Reg(LCD_Param.WriteGRAM);
+        p = Data;
+        while (total--) LCD->LCD_RAM = *p++;
+    }
+    else
+    {
+        /* 右边被裁：每行从源缓冲区按原始行长重新定位，只写可见的那 cw 个像素 */
+        for (row = 0; row < ch; row++)
+        {
+            p = Data + row * Width;
+            LCD_Set_Window(X, (uint16_t)(Y + row), (uint16_t)cw, 1);
+            LCD_Write_Reg(LCD_Param.WriteGRAM);
+            for (col = 0; col < cw; col++) LCD->LCD_RAM = *p++;
+        }
+    }
+}
+
 /**
  * @brief       显示一幅 RGB565 位图
- * @param       X, Y   : 左上角坐标（允许为负，会自动裁剪）
+ * @param       X, Y   : 左上角坐标，**不接受负数**
  * @param       Width  : 图片宽度(像素)
  * @param       Height : 图片高度(像素)
  * @param       Data   : RGB565 数据，按行存放，行内从左到右
  * @retval      无
+ * @note        形参是 uint16_t，传 -1 会在进函数之前就变成 65535，
+ *              随后被"起点已经越过屏幕边界"的判断直接 return，一个像素都不画。
+ *              内部的 int32_t 只用于防止 X+Width 溢出，不具备"负坐标裁剪"能力。
+ *              需要贴边显示时，调用者自己算好 X、Y 与 Width、Height 再传进来。
  */
 void LCD_DrawBitmap(uint16_t X, uint16_t Y, uint16_t Width, uint16_t Height,
                     const uint16_t *Data)
@@ -791,18 +958,23 @@ void LCD_DrawBitmap(uint16_t X, uint16_t Y, uint16_t Width, uint16_t Height,
 static void LCD_DrawFont(uint16_t X, uint16_t Y, uint16_t W, uint16_t H,
                          const uint8_t *Data)
 {
-    uint16_t line[32];                          /* 一行的像素缓冲，最大 32 像素宽 */
     uint16_t fg = LCD_Param.TextColor;
     uint16_t bg = LCD_Param.BackColor;
     uint16_t cw, ch, r, c;
     uint8_t  page, bit;
 
-    if (Data == 0 || W == 0 || H == 0 || W > 32) return;
+    if (Data == 0 || W == 0 || H == 0) return;
     if (X >= LCD_Param.Width || Y >= LCD_Param.Height) return;
 
     /* 右边和下边超出屏幕的部分先裁掉，保证窗口宽度和实际写入的像素个数一致 */
     cw = (uint16_t)(LCD_Param.Width  - X);  if (cw > W) cw = W;
     ch = (uint16_t)(LCD_Param.Height - Y);  if (ch > H) ch = H;
+
+    /* 整个字只设一次窗口，然后按行优先连续灌像素：窗口内的写入顺序是行优先，
+       与字模字节顺序完全一致，所以不需要行缓冲。原来每行设一次窗口，
+       一个 8x16 字要设 16 次、16x32 要设 32 次，撕裂窗口因此被拉长。 */
+    LCD_Set_Window(X, Y, cw, ch);
+    LCD_Write_Reg(LCD_Param.WriteGRAM);
 
     for (r = 0; r < ch; r++)
     {
@@ -810,11 +982,7 @@ static void LCD_DrawFont(uint16_t X, uint16_t Y, uint16_t W, uint16_t H,
         bit  = (uint8_t)(1u << (r & 7));
 
         for (c = 0; c < cw; c++)
-            line[c] = (Data[page * W + c] & bit) ? fg : bg;
-
-        LCD_Set_Window(X, (uint16_t)(Y + r), cw, 1);
-        LCD_Write_Reg(LCD_Param.WriteGRAM);
-        for (c = 0; c < cw; c++) LCD->LCD_RAM = line[c];
+            LCD->LCD_RAM = (Data[page * W + c] & bit) ? fg : bg;
     }
 }
 
@@ -963,6 +1131,105 @@ uint16_t LCD_ShowNum(uint16_t X, uint16_t Y, uint32_t Num, uint8_t Len,
     return LCD_ShowString(X, Y, buf, Font);
 }
 
+/*******************************
+ *      文本宽度与刷新痕迹控制
+ *      创建于2026-11-02
+ *******************************/
+
+/* LCD_Trace[] / LCD_TraceNext 的定义已上移到文件开头（切屏时要清空） */
+
+/**
+ * @brief       计算一段 UTF-8 文本在指定字号下的像素宽度
+ * @param       Str  : 文本，允许为 0
+ * @param       Font : LCD_FONT_8X16 / LCD_FONT_16X32
+ * @retval      像素宽度
+ * @note        规则与 LCD_ShowString 的排版完全一致：ASCII 取字库宽度（8 或 16），
+ *              汉字固定 16，残缺/四字节字节直接跳过（不占宽度）
+ */
+uint16_t LCD_TextW(const char *Str, uint8_t Font)
+{
+    const LCDFont_t *f;
+    uint16_t w = 0;
+    uint8_t  ch;
+
+    if (Str == 0) return 0;
+    if (Font >= LCD_FONT_NUM) Font = LCD_FONT_8X16;
+    f = &LCD_FontTable[Font];
+
+    while (*Str)
+    {
+        ch = (uint8_t)*Str;
+
+        if (ch < 0x80)                                              /* ASCII */
+        {
+            w = (uint16_t)(w + f->W);
+            Str++;
+        }
+        else if ((ch & 0xE0) == 0xC0 && Str[1] != 0)                /* 两字节：占一个汉字宽 */
+        {
+            w = (uint16_t)(w + 16);
+            Str += 2;
+        }
+        else if ((ch & 0xF0) == 0xE0 && Str[1] != 0 && Str[2] != 0) /* 三字节汉字 */
+        {
+            w = (uint16_t)(w + 16);
+            Str += 3;
+        }
+        else                                                        /* 四字节或残缺字节：跳过 */
+        {
+            Str++;
+        }
+    }
+    return w;
+}
+
+/**
+ * @brief       取某锚点上次画过的文本宽度
+ * @param       X, Y : 锚点
+ * @param       Font : 字号
+ * @retval      上次的宽度；没有记录返回 0
+ */
+static uint16_t LCD_TraceGet(uint16_t X, uint16_t Y, uint8_t Font)
+{
+    uint8_t i;
+
+    for (i = 0; i < LCD_TRACE_SLOTS; i++)
+        if (LCD_Trace[i].Used && LCD_Trace[i].X == X &&
+            LCD_Trace[i].Y == Y && LCD_Trace[i].Font == Font)
+            return LCD_Trace[i].W;
+
+    return 0;
+}
+
+/**
+ * @brief       记录某锚点本次画过的文本宽度
+ * @param       X, Y : 锚点
+ * @param       Font : 字号
+ * @param       W    : 宽度
+ * @retval      无
+ */
+static void LCD_TracePut(uint16_t X, uint16_t Y, uint8_t Font, uint16_t W)
+{
+    uint8_t i;
+
+    for (i = 0; i < LCD_TRACE_SLOTS; i++)
+        if (LCD_Trace[i].Used && LCD_Trace[i].X == X &&
+            LCD_Trace[i].Y == Y && LCD_Trace[i].Font == Font)
+        {
+            LCD_Trace[i].W = W;
+            return;
+        }
+
+    i = LCD_TraceNext;                              /* 没命中就轮换占用一个槽位 */
+    LCD_TraceNext = (uint8_t)((LCD_TraceNext + 1) % LCD_TRACE_SLOTS);
+
+    LCD_Trace[i].X    = X;
+    LCD_Trace[i].Y    = Y;
+    LCD_Trace[i].Font = Font;
+    LCD_Trace[i].W    = W;
+    LCD_Trace[i].Used = 1;
+}
+
 /**
  * @brief       格式化输出到屏幕，用法参考printf
  * @param       X, Y : 左上角起点
@@ -970,16 +1237,21 @@ uint16_t LCD_ShowNum(uint16_t X, uint16_t Y, uint32_t Num, uint8_t Len,
  * @param       Fmt  : 格式字符串，支持 %d %u %x %s %c %f 等
  * @param       ...  : 与格式串对应的参数
  * @retval      下一个字符的 X 坐标
- * @note        1) 先把 (X,Y) 到屏幕右边这一整条用背景色擦掉，再写字，
- *                 所以数值变短（比如 100 变成 9）不会留下上一次的残影；
- *              2) 缓冲区是 static 的 128 字节，超长会被截断；不重入，
+ * @note        1) 不再把整行擦一遍。LCD_DrawFont 会把每个字符格子的底色一起写掉，
+ *                 所以只有"本次文本比上次短"时，才去擦多出来的那段尾巴，
+ *                 稳态（等宽刷新）下一个像素都不擦，看不到"先黑一下再出字"；
+ *              2) 这个优化依赖"同一锚点反复写"的事实记录（4 个槽位）。如果某块区域
+ *                 被 LCD_Clear / 图形函数改写过，而你又恰好用更短的文本去覆盖它，
+ *                 可能留下残余，此时先自己 LCD_Fill 一块背景再调用；
+ *              3) 缓冲区是 static 的 128 字节，超长会被截断；不重入，
  *                 不要在中断里和主循环里同时调用；
- *              3) 不自动换行、不滚屏，要换行用返回值自己算 Y
+ *              4) 不自动换行、不滚屏，要换行用返回值自己算 Y
  */
 uint16_t LCD_printf(uint16_t X, uint16_t Y, uint8_t Font, const char *Fmt, ...)
 {
     static char buf[128];
     va_list ap;
+    uint16_t w, h, old;
 
     if (Fmt == 0) return X;
     if (Font >= LCD_FONT_NUM) Font = LCD_FONT_8X16;
@@ -988,9 +1260,23 @@ uint16_t LCD_printf(uint16_t X, uint16_t Y, uint8_t Font, const char *Fmt, ...)
     vsnprintf(buf, sizeof(buf), Fmt, ap);
     va_end(ap);
 
-    /* 先擦掉整条，数字变短时不会残留高位 */
-    LCD_Fill(X, Y, (uint16_t)(LCD_Param.Width - X), LCD_FontTable[Font].H,
-             LCD_Param.BackColor);
+    w   = LCD_TextW(buf, Font);
+    h   = LCD_FontTable[Font].H;
+    old = LCD_TraceGet(X, Y, Font);                 /* 上一次在同一位置画了多宽 */
+
+    if (old > w)                                    /* 只擦变短造成的尾巴 */
+    {
+        uint16_t sx = (uint16_t)(X + w);
+        uint16_t ew = (uint16_t)(old - w);
+
+        if (sx < LCD_Param.Width)
+        {
+            if (ew > (uint16_t)(LCD_Param.Width - sx))
+                ew = (uint16_t)(LCD_Param.Width - sx);
+            LCD_Fill(sx, Y, ew, h, LCD_Param.BackColor);
+        }
+    }
+    LCD_TracePut(X, Y, Font, w);
 
     return LCD_ShowString(X, Y, buf, Font);
 }
@@ -1035,6 +1321,55 @@ uint16_t LCD_ShowFPS(uint16_t X, uint16_t Y, uint8_t Font)
     return LCD_printf(X, Y, Font, "FPS:%3lu", (unsigned long)Fps);
 }
 
+/*******************************
+ *      LCD背光控制
+ *      创建于2026-11-03
+ *******************************/
+/**
+ * @brief       设置背光亮度
+ * @param       Duty : 占空比 0~100 (%)，超过 100 按 100 处理
+ * @retval      无
+ * @note        硬件：PB0 = TIM3_CH3，PSC=35 / ARR=99 → 72MHz/36/100 = 20 kHz。
+ *              一个周期正好 100 格，所以 **CCR 直接就是百分比**：写 30 就是 30%，
+ *              不需要任何换算、不需要中间变量。
+ *
+ *              Duty=100 时 CCR=100 > ARR=99，PWM1 模式下输出恒为有效电平，
+ *              这才是真正的 100%；若写 CCR=99 会变成 99%。
+ *              Duty=0 时 CCR=0，输出恒为无效电平，全灭。
+ *
+ *              CCR 已开预装载，新值在下一个周期边界才生效，
+ *              避免周期中途改值造成一个被拉长的长脉冲（低亮度慢速呼吸时那一下很明显）。
+ *              频率恒定 20 kHz，只改 CCR 不会改变频率，所以不存在"越暗越闪"。
+ *              函数不判断 PWM 是否已启动，启动由 LCD_Init() 完成。
+ *
+ *              **前提**：CubeMX 里必须是 PSC=35 / ARR=99。若 ARR 还是 999，
+ *              同样的 Duty 只会得到 1/10 的亮度——改定时器参数时别忘了一起改。
+ */
+void LCD_BackLight(uint8_t Duty)
+{
+    if (Duty > 100) Duty = 100;                             /* 参数越界夹紧 */
+
+    __HAL_TIM_SET_COMPARE(LCD_BL_TIM, LCD_BL_TIM_CH, Duty);  /* CCR 即百分比 */
+}
+
+/**
+ * @brief       启动背光 PWM 并置为最亮
+ * @param       无
+ * @retval      无
+ * @note        由 LCD_Init() 在第一时间调用：PB0 在 CubeMX 里已配成复用推挽，
+ *              但定时器没启动前输出是无效电平（背光全灭），所以要尽早 Start，
+ *              否则整个初始化期间（触摸复位+配置约 220ms）屏幕是黑的。
+ *              **前置条件**：main 里必须已经调用过 MX_TIM3_Init()（它负责开 TIM3 时钟
+ *              并把 PB0 切成 AF_PP），否则 HAL_TIM_PWM_Start 返回错误、背光不亮。
+ */
+static void LCD_BackLightInit(void)
+{
+    /* CCR 预装载要在启动输出之前打开，否则第一次改值仍是即时生效 */
+    __HAL_TIM_ENABLE_OCxPRELOAD(LCD_BL_TIM, LCD_BL_TIM_CH);
+    HAL_TIM_PWM_Start(LCD_BL_TIM, LCD_BL_TIM_CH);
+    LCD_BackLight(100);                 /* 上电默认最亮 */
+}
+
 /**
  * @brief       LCD初始化
  * @param
@@ -1042,29 +1377,34 @@ uint16_t LCD_ShowFPS(uint16_t X, uint16_t Y, uint8_t Font)
  */
 void LCD_Init(uint16_t TextColor, uint16_t BackColor)
 {
+    LCD_BackLightInit();
+    LCD_I2C_DelayInit();                /* 软件 I2C 延时用 DWT，必须先打开周期计数 */
+
+    /* 读 ID 同时充当一次"读通路自检"：
+       0xD3 的返回值前两字节无意义（dummy），第 3、4 字节拼成 0x7796。
+       读异常时常见 0x0000 / 0xFFFF / 0x7797，说明 FSMC 读时序不够
+       （ST7796 要求 TRC>=160ns、读 ID 的 TCS>=45ns） */
     LCD_Write_Reg(0XD3);
     LCD_Param.ID = LCD_Read_Data();  /* dummy read */
     LCD_Param.ID = LCD_Read_Data();  /* 读到0X00 */
     LCD_Param.ID = LCD_Read_Data();  /* 读取0X77 */
     LCD_Param.ID <<= 8;
     LCD_Param.ID |= LCD_Read_Data(); /* 读取0X96 */
-    // printf("LCD ID: %04X\r\n", LCD_Param.ID);
-    // if (LCD_Param.ID != 0x7796) { printf("ID error!\r\n"); return; }
+
+    LCD_Panel_State = (LCD_Param.ID == 0x7796) ? 0 : 1;
 
     LCD_ST7796_RegInit();
 
-    LCD_Param.Dir       = 0;      /* 竖屏 */
-    LCD_Param.Width     = 320;
-    LCD_Param.Height    = 480;
     LCD_Param.WriteGRAM = 0x2C;
     LCD_Param.SetXCmd   = 0x2A;
     LCD_Param.SetYCmd   = 0x2B;
     LCD_Param.TextColor = TextColor;
-    LCD_Param.BackColor = BackColor;
+    LCD_Param.BackColor = BackColor;    /* SetRotation 里清屏要用，必须先赋值 */
 
-    LCD_TP_Init();                      /* 0=ID 匹配成功，1=I2C 读 ID 失败或不是 GT911 */
+    /* 方向、W/H、MADCTL、清屏一次做完；默认方向在 LCD.h 的 LCD_DEFAULT_ROT 里改 */
+    LCD_SetRotation(LCD_DEFAULT_ROT);
 
-    LCD_Clear(BackColor);
+    LCD_TP_State = LCD_TP_Init();       /* 0=ID 匹配成功，1=I2C 读 ID 失败或不是 GT911 */
 }
 /********************************触摸中断*********************************/
 
@@ -1082,37 +1422,96 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
  * @brief       触摸扫描(中断驱动)，主循环每轮调用一次
  * @param       无
  * @retval      当前触摸点数, 0=无触摸
+ * @note        I2C 失败时**不清标志、留到下一轮重试**，这一点是关键：
+ *              GT911 要等 0x814E 被读走才拉低 INT。若失败就放弃，0x814E 保持"有数据"、
+ *              INT 停在电平高，而 EXTI 配的是上升沿，之后不会再有跳变，
+ *              结果是触摸一直无响应到断电重启。重试仍然失败时把 TP_IntFlag 置回 1，
+ *              让主循环下一轮继续尝试；读到"无新数据"但 INT 仍为高时同样置回标志。
+ *              失败时返回值统一取 TP_Data.Count，不会出现"返回值说抬起、Count 说按着"。
  */
 uint8_t LCD_T_ScanIT(void)
 {
-    uint8_t status, buf[4], zero = 0, i, cnt;
+    uint8_t status, buf[4], zero = 0, i, cnt, retry;
 
     if (!TP_IntFlag) return TP_Data.Count;        /* 无中断：直接返回上次状态 */
     TP_IntFlag = 0;                               /* 先清标志，扫描期间来的新边沿不会丢 */
 
-    if (LCD_T_Read(GT9XXX_GSTID_REG, &status, 1)) return 0;
+    /* 读就绪寄存器：失败重试 3 次，全部失败则保留标志、保持上次点数 */
+    for (retry = 0; retry < 3; retry++)
+    {
+        if (LCD_T_Read(GT9XXX_GSTID_REG, &status, 1) == 0) break;
+    }
+    if (retry >= 3) { TP_IntFlag = 1; return TP_Data.Count; }
 
-    if (!(status & 0x80)) return TP_Data.Count;   /* bit7=0, 无新数据 */
+    if (!(status & 0x80))                         /* bit7=0, 无新数据 */
+    {
+        /* 正常情况 INT 此时应为低。若它仍停在高电平，说明主机和 GT911 的状态机
+           不同步（下面清标志那步可能被吞了），再置一次标志让下一轮重读，
+           否则上升沿不会再来，触摸会永久失效 */
+        if (HAL_GPIO_ReadPin(LCD_T_INT_GPIO_Port, LCD_T_INT_Pin) == GPIO_PIN_SET)
+            TP_IntFlag = 1;
+        return TP_Data.Count;
+    }
 
     cnt = status & 0x0F;
-    LCD_T_Write(GT9XXX_GSTID_REG, &zero, 1);      /* 清就绪标志，GT911 才会拉低 INT */
+
+    /* 清就绪标志：GT911 只有看到这里被写 0 才会拉低 INT 并为下一帧准备数据，
+       失败同样重试，避免 INT 永久停在高电平 */
+    for (retry = 0; retry < 3; retry++)
+    {
+        if (LCD_T_Write(GT9XXX_GSTID_REG, &zero, 1) == 0) break;
+    }
+    if (retry >= 3) { TP_IntFlag = 1; return TP_Data.Count; }
 
     if (cnt == 0) { TP_Data.Count = 0; return 0; }/* 抬起 */
     if (cnt > GT_MAX_TOUCH) cnt = GT_MAX_TOUCH;
 
     for (i = 0; i < cnt; i++)
     {
+        uint16_t tx, ty;
+        int32_t  lx, ly;
+
         if (LCD_T_Read(GT9XXX_TP1_REG + 8 * i, buf, 4)) break;   /* 读失败：停止，已读到的点仍然有效 */
 
-        /* 竖屏(Dir=0)直接用原始值, 不翻转 */
-        TP_Data.X[i] = ((uint16_t)buf[1] << 8) | buf[0];
-        TP_Data.Y[i] = ((uint16_t)buf[3] << 8) | buf[2];
+        /* GT911 永远按面板原生方向上报：tx∈[0,320) ty∈[0,480)，与显示方向无关 */
+        tx = ((uint16_t)buf[1] << 8) | buf[0];
+        ty = ((uint16_t)buf[3] << 8) | buf[2];
 
-        /* 边界毛刺钳到屏幕内，不再丢弃整点 */
-        if (TP_Data.X[i] >= LCD_Param.Width)  TP_Data.X[i] = LCD_Param.Width  - 1;
-        if (TP_Data.Y[i] >= LCD_Param.Height) TP_Data.Y[i] = LCD_Param.Height - 1;
+        /* 按当前显示方向把原生坐标转成逻辑坐标。
+           公式与 LCD_SetRotation() 里的 MADCTL 一一对应，改一边必须改另一边；
+           若横屏下画面正而触摸差 180°，把 ROT_90 与 ROT_270 两条对调。 */
+        switch (LCD_Param.Dir)
+        {
+        case LCD_ROT_90:                                   /* MADCTL 0x68：横屏 */
+            lx = (int32_t)ty;
+            ly = (int32_t)(LCD_PANEL_W - 1) - tx;
+            break;
+        case LCD_ROT_270:                                  /* MADCTL 0xA8：横屏反向 */
+            lx = (int32_t)(LCD_PANEL_H - 1) - ty;
+            ly = (int32_t)tx;
+            break;
+        case LCD_ROT_180:                                  /* MADCTL 0xC8：竖屏倒置 */
+            lx = (int32_t)(LCD_PANEL_W - 1) - tx;
+            ly = (int32_t)(LCD_PANEL_H - 1) - ty;
+            break;
+        default:                                           /* MADCTL 0x08：竖屏，不翻转 */
+            lx = (int32_t)tx;
+            ly = (int32_t)ty;
+            break;
+        }
+
+        /* 先钳位再加回无符号：减法可能为负，直接塞 uint16_t 会变成 65xxx */
+        if (lx < 0) lx = 0;
+        if (ly < 0) ly = 0;
+        if (lx >= LCD_Param.Width)  lx = LCD_Param.Width  - 1;
+        if (ly >= LCD_Param.Height) ly = LCD_Param.Height - 1;
+
+        TP_Data.X[i] = (uint16_t)lx;
+        TP_Data.Y[i] = (uint16_t)ly;
     }
 
+    /* 一个点都没读出来：保持上次的坐标和点数，不要伪装成"抬起" */
+    if (i == 0) return TP_Data.Count;
     if (i < cnt) cnt = i;                         /* 中途读失败时，后面的点不算数 */
     TP_Data.Count = cnt;
     return cnt;

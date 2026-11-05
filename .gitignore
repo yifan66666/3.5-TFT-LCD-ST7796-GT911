@@ -1,0 +1,34 @@
+# ===== 编译产物 =====
+build/
+cmake-build-*/
+Debug/
+Release/
+*.o
+*.obj
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.axf
+*.lst
+*.crf
+*.dep
+*.lnp
+*.htm
+*.i
+*.sct
+*.iex
+*.uvguix.*
+*.uvoptx
+*.bak
+
+# ===== IDE / 编辑器配置 =====
+.idea/
+.vscode/
+*.swp
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
